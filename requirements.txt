@@ -1,0 +1,15 @@
+# AlphaVibes Backend — Python Dependencies
+# Install: pip install -r requirements.txt
+
+fastapi
+uvicorn[standard]
+yfinance
+requests
+httpx
+pandas
+numpy
+pandas-ta
+redis
+python-dotenv
+orjson
+pydantic
