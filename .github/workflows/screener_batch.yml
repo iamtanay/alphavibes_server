@@ -1,0 +1,61 @@
+# .github/workflows/screener_batch.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Nightly screener batch — runs at 6:00 AM IST (00:30 UTC) on weekdays.
+# Fetches OHLCV for 50 Nifty stocks, computes real RSI + Supertrend,
+# writes results to Redis (via REDIS_URL secret) so the screener endpoint
+# serves real technical data instead of placeholders.
+#
+# Required repository secrets:
+#   REDIS_URL   — Upstash Redis URL (rediss://...)
+#
+# Optional:
+#   BATCH_DELAY_S — seconds between stock fetches (default: 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Screener Nightly Batch
+
+on:
+  schedule:
+    # 00:30 UTC = 06:00 AM IST (UTC+5:30)
+    - cron: "30 0 * * 1-5"  # Mon–Fri only (market days)
+  workflow_dispatch:          # Allow manual trigger from GitHub UI
+
+jobs:
+  batch:
+    name: Fetch & compute screener signals
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run screener batch
+        env:
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          BATCH_DELAY_S: "1"
+          OUTPUT_FILE: "screener_data.json"
+        run: python scripts/screener_batch.py
+
+      - name: Upload screener data as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screener-data-${{ github.run_id }}
+          path: screener_data.json
+          retention-days: 7
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Screener batch failed. Check logs above."
+          echo "Partial data may still have been written to Redis."

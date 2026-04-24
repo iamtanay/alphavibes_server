@@ -10,33 +10,15 @@ It:
   3. Assembles the final AnalysisResponse dict
   4. Is completely decoupled from HTTP concerns
 
-Architecture decision — runtime vs pre-computed:
-─────────────────────────────────────────────────────────────────────────────
-DECISION: Runtime computation with Redis caching (15-minute TTL)
-
-Rationale for runtime (not pre-computed batch):
-
-  PRO runtime:
-  • Budget = ₹0 for storage/compute. Pre-computing 500 stocks daily needs
-    a persistent server + ~500 yfinance calls every night = hit Yahoo's
-    rate limit hard, get blocked.
-  • User base is small in V1 — no need to pre-compute everything.
-  • Cache handles repeated requests (same stock, multiple users = 1 fetch).
-  • Any stock (not just Nifty 500) can be analysed on demand.
-
-  PRO pre-computed:
-  • Screener needs all 500 stocks — we DO pre-compute the screener subset
-    (see screener.py) but that's just 15 fields per stock, not the full
-    AnalysisResponse.
-  • Screener batch is separate from the full analysis pipeline.
-
-  CONCLUSION:
-  • Full analysis = runtime with 15-min Redis cache.
-  • Screener data = nightly batch for the top 200 stocks only.
-  • Quote endpoint = runtime with 5-min cache (lightweight).
-
-This means: zero cost for idle time, scales to ~100 requests/day on
-Railway's free tier without issues.
+FIXES (Roadmap Phase 1 + 4):
+  • FIX #3  — promoter_holding and promoter_pledge are now patched into
+    StockMetrics AFTER compute_shareholding() runs, before compute_personas().
+    This makes Jhunjhunwala + Lynch personas use real promoter data.
+  • FIX #6  — Request deduplication via asyncio.Event(). If two requests
+    for the same ticker arrive simultaneously (both miss cache), only ONE
+    actually runs the yfinance fetch. The second waits on an asyncio.Event
+    and reads the result when the first completes. Prevents double-fetching
+    and race conditions under concurrent load.
 ─────────────────────────────────────────────────────────────────────────────
 """
 
@@ -57,6 +39,21 @@ logger = logging.getLogger(__name__)
 # 1 Crore = 10,000,000 INR
 _CR = 10_000_000
 
+# ── Request deduplication ──────────────────────────────────────────────────
+#
+# Maps ticker → asyncio.Event that is set once the analysis completes.
+# A concurrent request for the same ticker waits on this event, then reads
+# the result from _dedup_results.
+#
+# This handles the thundering herd problem: many simultaneous requests for
+# a popular stock all miss the cache and would otherwise each spawn a 20s
+# yfinance fetch. With deduplication, only the first request runs the fetch;
+# all others wait and get the same result instantly.
+#
+_dedup_events: dict[str, asyncio.Event] = {}
+_dedup_results: dict[str, Any] = {}
+_dedup_lock = asyncio.Lock()
+
 
 def _safe_float(v: Any, d: int = 2) -> float:
     """Safe float with fallback to 0.0."""
@@ -70,7 +67,7 @@ def _safe_float(v: Any, d: int = 2) -> float:
 
 async def run_analysis(ticker: str) -> dict[str, Any]:
     """
-    Full analysis pipeline for one stock.
+    Full analysis pipeline for one stock, with request deduplication.
 
     Args:
         ticker: NSE ticker symbol, e.g. "RELIANCE" or "RELIANCE.NS"
@@ -81,10 +78,70 @@ async def run_analysis(ticker: str) -> dict[str, Any]:
     Raises:
         TickerNotFoundError: if the ticker is invalid
     """
-    # Resolve ticker to yfinance symbol
     yf_symbol = resolve_yf_symbol(ticker)
     clean_ticker = ticker.upper().replace(".NS", "").replace(".BO", "")
 
+    # ── Deduplication check ───────────────────────────────────────────────
+    async with _dedup_lock:
+        if clean_ticker in _dedup_events:
+            # Another coroutine is already fetching this ticker — wait for it
+            event = _dedup_events[clean_ticker]
+            logger.info("Dedup wait: %s (another fetch in progress)", clean_ticker)
+            should_wait = True
+        else:
+            # We are the first — register ourselves as the fetcher
+            event = asyncio.Event()
+            _dedup_events[clean_ticker] = event
+            should_wait = False
+
+    if should_wait:
+        # Wait for the primary fetch to complete (with a 60s safety timeout)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=60.0)
+        except asyncio.TimeoutError:
+            logger.warning("Dedup wait timed out for %s — running own fetch", clean_ticker)
+        else:
+            # Primary succeeded; return its cached result
+            result = _dedup_results.get(clean_ticker)
+            if result is not None:
+                logger.info("Dedup hit: served %s from in-flight result", clean_ticker)
+                return result
+            # If result is absent (primary raised), fall through to own fetch
+
+    # ── Primary fetch path ────────────────────────────────────────────────
+    try:
+        result = await _run_analysis_inner(clean_ticker, yf_symbol)
+    except Exception:
+        # Signal waiting coroutines so they don't hang forever
+        async with _dedup_lock:
+            _dedup_events.pop(clean_ticker, None)
+            _dedup_results.pop(clean_ticker, None)
+        if clean_ticker in _dedup_events:
+            event.set()
+        raise
+
+    # Store result and signal waiters
+    async with _dedup_lock:
+        _dedup_results[clean_ticker] = result
+        _dedup_events.pop(clean_ticker, None)
+
+    event.set()
+
+    # Cleanup result after a short window (prevent unbounded memory growth)
+    async def _cleanup():
+        await asyncio.sleep(5)
+        _dedup_results.pop(clean_ticker, None)
+
+    asyncio.create_task(_cleanup())
+
+    return result
+
+
+async def _run_analysis_inner(clean_ticker: str, yf_symbol: str) -> dict[str, Any]:
+    """
+    Inner analysis pipeline — called by run_analysis() after deduplication.
+    This does the actual work.
+    """
     logger.info("Starting analysis for %s (%s)", clean_ticker, yf_symbol)
 
     # ── Step 1: Fetch all raw data ────────────────────────────────────────
@@ -92,7 +149,6 @@ async def run_analysis(ticker: str) -> dict[str, Any]:
     info = raw.info
 
     # ── Step 2: Build technical analysis (CPU-bound but fast) ─────────────
-    # Run in thread pool to avoid blocking event loop on large DataFrames
     technicals = await asyncio.to_thread(
         compute_technicals,
         raw.history_5y,
@@ -118,7 +174,11 @@ async def run_analysis(ticker: str) -> dict[str, Any]:
         raw.quarterly_cashflow,
     )
 
-    # ── Step 5: Extract flat metrics and score all personas ───────────────
+    # ── Step 5: Shareholding pattern ─────────────────────────────────────
+    # Run BEFORE extract_metrics so promoter_holding is available for personas.
+    shareholding = await asyncio.to_thread(compute_shareholding, info, clean_ticker)
+
+    # ── Step 6: Extract flat metrics ──────────────────────────────────────
     metrics = await asyncio.to_thread(
         extract_metrics,
         info,
@@ -127,33 +187,44 @@ async def run_analysis(ticker: str) -> dict[str, Any]:
         technicals,
     )
 
-    personas = await asyncio.to_thread(compute_personas, metrics)
+    # ── FIX #3: Patch promoter data into metrics ──────────────────────────
+    # extract_metrics() sets promoter_holding = None (cannot get from info).
+    # compute_shareholding() already extracted it from heldPercentInsiders.
+    # Wire them together here so Jhunjhunwala + Lynch personas get real data.
+    try:
+        metrics.promoter_holding = shareholding.get("promoter")        # float in %
+        metrics.promoter_pledge  = shareholding.get("promoterPledge")  # float in %
+        metrics.fii_holding      = shareholding.get("fii")             # float in %
+    except Exception as exc:
+        logger.warning("Could not patch promoter holding into metrics: %s", exc)
 
-    # ── Step 6: Shareholding pattern ─────────────────────────────────────
-    shareholding = await asyncio.to_thread(compute_shareholding, info, clean_ticker)
+    # ── Step 7: Score all personas ────────────────────────────────────────
+    persona_result = await asyncio.to_thread(compute_personas, metrics)
+    personas  = persona_result["personas"]
+    conflicts = persona_result["conflicts"]
 
-    # ── Step 7: Peer comparison ───────────────────────────────────────────
+    # ── Step 8: Peer comparison ───────────────────────────────────────────
     peers = await _build_peers(clean_ticker, info)
 
-    # ── Step 8: Build Quote object ────────────────────────────────────────
+    # ── Step 9: Build Quote object ────────────────────────────────────────
     quote = _build_quote(clean_ticker, yf_symbol, info)
 
     # ── Assemble final response ───────────────────────────────────────────
     return {
-        "ticker":      clean_ticker,
-        "quote":       quote,
-        "technical":   technicals,
-        "fundamental": fundamentals,
-        "personas":    personas,
+        "ticker":       clean_ticker,
+        "quote":        quote,
+        "technical":    technicals,
+        "fundamental":  fundamentals,
+        "personas":     personas,
+        "conflicts":    conflicts,
         "shareholding": shareholding,
-        "peers":       peers,
-        "chartData":   chart_data,
+        "peers":        peers,
+        "chartData":    chart_data,
     }
 
 
 def _build_quote(ticker: str, yf_symbol: str, info: dict) -> dict[str, Any]:
     """Build the Quote object from yfinance info."""
-    # Current price
     price = (
         info.get("currentPrice")
         or info.get("regularMarketPrice")
@@ -161,7 +232,6 @@ def _build_quote(ticker: str, yf_symbol: str, info: dict) -> dict[str, Any]:
         or 0.0
     )
 
-    # Price change
     prev_close = info.get("previousClose") or info.get("regularMarketPreviousClose") or price
     change = _safe_float(price - prev_close, 2)
     change_pct = _safe_float(((price - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
@@ -201,7 +271,6 @@ async def _build_peers(ticker: str, info: dict) -> list[dict[str, Any]]:
 
     peer_symbols = [p["yf_symbol"] for p in peer_metas]
 
-    # Fetch peer quotes concurrently (lightweight — just info dict)
     try:
         peer_infos = await fetch_multiple_quotes(peer_symbols)
     except Exception as exc:
@@ -221,7 +290,6 @@ async def _build_peers(ticker: str, info: dict) -> list[dict[str, Any]]:
         "isSelected": True,
     })
 
-    # Add peers
     for meta in peer_metas:
         sym = meta["yf_symbol"]
         p_info = peer_infos.get(sym, {})

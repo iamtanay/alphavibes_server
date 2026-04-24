@@ -14,6 +14,17 @@ Routes implemented:
   GET  /api/screener             Pre-computed screener
   GET  /api/compare              Side-by-side comparison
   POST /api/session/check        Rate limit status
+  GET  /health                   Uptime check
+
+FIXES (Roadmap Phase 1):
+  • FIX #2 — Screener no longer shows fake RSI or Supertrend values.
+    These columns required OHLCV that we don't fetch at screener time.
+    Removed from the response rather than showing dishonest placeholder data.
+  • FIX #2 — topPersona is now computed from a lightweight info-dict-only
+    score (using compute_top_persona()) instead of always returning
+    "Growth Investor". PE, ROE, growth rate, and D/E from the info dict
+    are enough for a meaningful first-pass persona assignment.
+  • Added "Updated daily · EOD data" badge metadata to screener response.
 ─────────────────────────────────────────────────────────────────────────────
 """
 
@@ -48,7 +59,7 @@ router = APIRouter()
 #  RATE_WINDOW_SECONDS=N    → window length in seconds (default 18000 = 5h)
 #
 #  Same ticker re-analysed within the window is FREE — only unique tickers
-#  count against the limit. So refreshing RELIANCE doesn't burn extra slots.
+#  count against the limit.
 #
 _rate_store: dict[str, list[float]] = {}    # session_id → [slot timestamps]
 _ticker_store: dict[str, set[str]] = {}     # session_id → {tickers seen}
@@ -81,8 +92,7 @@ def _check_rate_limit(session_id: str, ticker: str) -> tuple[bool, int, float | 
     Check rate limit for a session.
 
     Re-analysing the same ticker within the window does NOT consume a new
-    slot — only unique tickers count. This prevents punishing users who
-    refresh a stock page, while still limiting broad discovery usage.
+    slot — only unique tickers count.
 
     Returns:
         (allowed, unique_tickers_used, next_reset_timestamp_or_None)
@@ -96,16 +106,13 @@ def _check_rate_limit(session_id: str, ticker: str) -> tuple[bool, int, float | 
     timestamps    = [ts for ts in _rate_store.get(session_id, []) if ts > window_start]
     seen_tickers  = _ticker_store.get(session_id, set())
 
-    # Same ticker within the window — free repeat, no slot consumed
     if ticker in seen_tickers:
         return True, len(timestamps), None
 
-    # New ticker — check limit
     if len(timestamps) >= _RATE_LIMIT:
         oldest = min(timestamps)
         return False, len(timestamps), oldest + _RATE_WINDOW
 
-    # Charge one slot
     timestamps.append(now)
     seen_tickers.add(ticker)
     _rate_store[session_id]  = timestamps
@@ -124,15 +131,12 @@ async def analyse_ticker(ticker: str, request: Request) -> dict[str, Any]:
     """
     ticker = ticker.upper().strip()
 
-    # ── Cache check ───────────────────────────────────────────────────────
     cache_k = analysis_key(ticker)
     cached = await cache_get(cache_k)
     if cached:
         logger.info("Cache HIT: %s", ticker)
-        # Add cache header so frontend knows this was cached
         return cached
 
-    # ── Rate limit check ──────────────────────────────────────────────────
     session_id = _get_session_id(request)
     allowed, used, next_reset = _check_rate_limit(session_id, ticker)
 
@@ -150,7 +154,6 @@ async def analyse_ticker(ticker: str, request: Request) -> dict[str, Any]:
             },
         )
 
-    # ── Run analysis ──────────────────────────────────────────────────────
     try:
         result = await run_analysis(ticker)
     except TickerNotFoundError as exc:
@@ -165,9 +168,7 @@ async def analyse_ticker(ticker: str, request: Request) -> dict[str, Any]:
             detail={"error": "analysis_failed", "message": "Analysis failed. Please try again."},
         ) from exc
 
-    # ── Cache result ──────────────────────────────────────────────────────
     await cache_set(cache_k, result, ttl=ANALYSIS_TTL)
-
     return result
 
 
@@ -188,8 +189,6 @@ async def get_quote(ticker: str) -> dict[str, Any]:
 
     from app.data.nse_stocks import resolve_yf_symbol
     from app.services.analyser import _build_quote
-    from datetime import datetime, timezone
-    import math
 
     yf_symbol = resolve_yf_symbol(ticker)
 
@@ -216,7 +215,6 @@ async def search(q: str = Query("", min_length=0)) -> dict[str, Any]:
     """
     q = q.strip()
     if not q:
-        # Return popular stocks as suggestions
         popular = [
             TICKER_TO_META[t] for t in ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK"]
             if t in TICKER_TO_META
@@ -262,8 +260,7 @@ async def market_overview() -> dict[str, Any]:
     if cached:
         return cached
 
-    # Fetch indices and a sample of movers concurrently
-    indices_symbols = ["^NSEI", "^BSESN"]  # Nifty 50, Sensex
+    indices_symbols = ["^NSEI", "^BSESN"]
     mover_symbols = [
         "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
         "HINDUNILVR.NS", "ITC.NS", "BAJFINANCE.NS", "LT.NS", "KOTAKBANK.NS",
@@ -277,7 +274,6 @@ async def market_overview() -> dict[str, Any]:
         logger.warning("Market overview fetch failed: %s", exc)
         all_infos = {}
 
-    # ── Indices ───────────────────────────────────────────────────────────
     indices = []
     index_meta = {"^NSEI": "Nifty 50", "^BSESN": "Sensex"}
 
@@ -297,7 +293,6 @@ async def market_overview() -> dict[str, Any]:
             "changePercent": chg_p,
         })
 
-    # ── Movers ────────────────────────────────────────────────────────────
     movers = []
     for sym in mover_symbols:
         info = all_infos.get(sym, {})
@@ -315,11 +310,10 @@ async def market_overview() -> dict[str, Any]:
             "changePercent": chg_p,
         })
 
-    # Sort movers
-    gainers = sorted([m for m in movers if m["changePercent"] > 0],
-                     key=lambda x: x["changePercent"], reverse=True)[:5]
-    losers  = sorted([m for m in movers if m["changePercent"] < 0],
-                     key=lambda x: x["changePercent"])[:5]
+    gainers  = sorted([m for m in movers if m["changePercent"] > 0],
+                      key=lambda x: x["changePercent"], reverse=True)[:5]
+    losers   = sorted([m for m in movers if m["changePercent"] < 0],
+                      key=lambda x: x["changePercent"])[:5]
     trending = sorted(movers, key=lambda x: abs(x["changePercent"]), reverse=True)[:5]
 
     result = {
@@ -347,28 +341,25 @@ async def screener(
     min_roe: float = Query(0),
     min_revenue_growth: float = Query(-100),
     max_de: float = Query(100),
-    min_rsi: float = Query(0),
-    max_rsi: float = Query(100),
-    supertrend: str = Query(""),    # "Bullish" | "Bearish" | ""
     sort_by: str = Query("marketCap"),
     sort_dir: str = Query("desc"),
     limit: int = Query(100),
 ) -> dict[str, Any]:
     """
     Screener with filters.
-    Results are cached; filtered/sorted on each request.
-    """
-    # Build a hash of filter params to create a cache key for exact filter combos
-    params_hash = hashlib.md5(
-        json.dumps(locals(), sort_keys=True, default=str).encode()
-    ).hexdigest()[:8]
 
-    # Try full screener cache first
+    NOTE: RSI and Supertrend filters have been removed. These require OHLCV
+    data that is not available at screener build time without a full analysis.
+    Showing hardcoded placeholder values (e.g. RSI=50, Supertrend=Bullish)
+    would be misleading. These columns will be re-introduced once the nightly
+    batch script (scripts/screener_batch.py) populates real technical values.
+
+    Results are cached for 24h and filtered/sorted on each request.
+    """
     base_cache_k = screener_key()
     all_stocks = await cache_get(base_cache_k)
 
     if not all_stocks:
-        # Build screener data by fetching a subset of stocks
         all_stocks = await _build_screener_data()
         await cache_set(base_cache_k, all_stocks, ttl=SCREENER_TTL)
 
@@ -380,9 +371,6 @@ async def screener(
     filtered = [s for s in filtered if s.get("roe", 0) >= min_roe]
     filtered = [s for s in filtered if s.get("revenueGrowth", 0) >= min_revenue_growth]
     filtered = [s for s in filtered if s.get("debtEquity", 0) <= max_de]
-    filtered = [s for s in filtered if min_rsi <= s.get("rsi", 50) <= max_rsi]
-    if supertrend:
-        filtered = [s for s in filtered if s.get("supertrend", "") == supertrend]
 
     # Sort
     reverse = sort_dir.lower() == "desc"
@@ -394,6 +382,7 @@ async def screener(
     return {
         "results": filtered[:limit],
         "total": len(filtered),
+        "dataNote": "Updated daily · EOD data · Technical indicators coming soon",
     }
 
 
@@ -401,13 +390,19 @@ async def _build_screener_data() -> list[dict]:
     """
     Build screener data for top 100 stocks.
     Fetches quotes concurrently in batches of 20.
-    Only lightweight quote data — no full analysis.
+
+    HONEST DATA POLICY (FIX #2):
+    • RSI and Supertrend are NOT included — they require OHLCV which we
+      don't fetch here. Better to omit than to show fake values.
+    • topPersona is computed from a lightweight info-dict score using
+      compute_top_persona() — PE, ROE, growth, and D/E are enough for a
+      meaningful first-pass assignment.
     """
-    # Pick top 100 stocks from universe for screener
+    from app.services.personas import compute_top_persona
+
     screener_tickers = [s for s in UNIVERSE[:100]]
     symbols = [s["yf_symbol"] for s in screener_tickers]
 
-    # Fetch in batches of 20 to avoid hammering Yahoo
     BATCH = 20
     all_infos: dict = {}
     for i in range(0, len(symbols), BATCH):
@@ -417,7 +412,6 @@ async def _build_screener_data() -> list[dict]:
             all_infos.update(batch_infos)
         except Exception as exc:
             logger.warning("Screener batch %d failed: %s", i, exc)
-        # Small delay between batches to be polite to Yahoo
         if i + BATCH < len(symbols):
             await asyncio.sleep(0.5)
 
@@ -433,7 +427,6 @@ async def _build_screener_data() -> list[dict]:
         prev   = info.get("previousClose") or price
         chg_p  = round(((price - prev) / prev) * 100, 2) if prev else 0
 
-        # D/E normalisation
         de = info.get("debtToEquity")
         if de is not None:
             try:
@@ -447,11 +440,6 @@ async def _build_screener_data() -> list[dict]:
         market_cap = info.get("marketCap") or 0
         market_cap_cr = round(market_cap / 10_000_000, 0)
 
-        # RSI: not in yfinance info — approximate from momentum
-        # True RSI requires OHLCV; use 50 as neutral default
-        rsi_approx = 50.0
-
-        # Revenue growth
         rev_growth = 0.0
         rg = info.get("revenueGrowth")
         if rg is not None:
@@ -478,6 +466,12 @@ async def _build_screener_data() -> list[dict]:
             except (TypeError, ValueError):
                 pass
 
+        # Lightweight persona scoring from info dict only — no OHLCV required
+        try:
+            top_persona = compute_top_persona(info)
+        except Exception:
+            top_persona = "warren-buffett"
+
         results.append({
             "ticker":         ticker,
             "name":           info.get("shortName") or info.get("longName") or ticker,
@@ -489,10 +483,8 @@ async def _build_screener_data() -> list[dict]:
             "roe":            roe,
             "revenueGrowth":  rev_growth,
             "debtEquity":     round(de, 2),
-            "rsi":            rsi_approx,
-            "supertrend":     "Bullish" if chg_p > 0 else "Bearish",  # Proxy
-            "topPersona":     "Growth Investor",  # Default until full analysis runs
-            "personaScore":   0,
+            # RSI and Supertrend intentionally excluded — no OHLCV at screener time
+            "topPersona":     top_persona,
         })
 
     return results
@@ -516,7 +508,6 @@ async def compare_stocks(
             detail={"error": "invalid_request", "message": "Provide at least 2 tickers."},
         )
 
-    # Run analyses concurrently
     tasks = [run_analysis(t) for t in ticker_list]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -543,7 +534,6 @@ async def session_check(request: Request) -> dict[str, Any]:
     """
     Returns the current rate limit status for this session.
     Does NOT consume a rate limit slot.
-    Reports unique tickers used (not raw request count).
     """
     if _DISABLE_RL:
         return {"used": 0, "remaining": _RATE_LIMIT, "limit": _RATE_LIMIT, "nextResetAt": None}
@@ -553,7 +543,7 @@ async def session_check(request: Request) -> dict[str, Any]:
     window_start = now - _RATE_WINDOW
 
     timestamps   = [ts for ts in _rate_store.get(session_id, []) if ts > window_start]
-    used         = len(timestamps)           # unique tickers charged
+    used         = len(timestamps)
     remaining    = max(0, _RATE_LIMIT - used)
 
     next_reset = None

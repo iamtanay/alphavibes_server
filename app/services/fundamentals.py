@@ -14,6 +14,13 @@ Design notes:
   • All yfinance keys have been verified against the actual API responses.
   • Values in Crores (₹ Crores = ₹ 10 million) for Indian stocks.
     yfinance returns values in INR — we divide by 10M to get Crores.
+
+UPDATE (Roadmap Phase 1 — FIX #1):
+  • income_stmt (yfinance ≥ 0.2.x) uses different row index labels than the
+    legacy `financials` attribute. Both are now handled via _resolve_row()
+    which tries multiple label aliases. This makes financial statement parsing
+    robust regardless of which yfinance version or API path was used to fetch
+    the data.
 ─────────────────────────────────────────────────────────────────────────────
 """
 
@@ -65,6 +72,37 @@ def _get(d: dict, *keys, default=None):
         if v is not None and not (isinstance(v, float) and math.isnan(v)):
             return v
     return default
+
+
+# ── Row label aliases ─────────────────────────────────────────────────────
+#
+# income_stmt (yfinance ≥ 0.2.x) uses different index labels than the
+# legacy `financials` attribute. _resolve_row() finds whichever alias
+# is present in a given DataFrame, making parsing robust across yfinance
+# versions and API paths (Fix #1).
+#
+_ROW_ALIASES: dict[str, list[str]] = {
+    "Total Revenue":    ["Total Revenue", "Revenue", "TotalRevenue"],
+    "Gross Profit":     ["Gross Profit", "GrossProfit"],
+    "Operating Income": ["Operating Income", "EBIT", "OperatingIncome"],
+    "Net Income":       ["Net Income", "Net Income Common Stockholders", "NetIncome"],
+    "Basic EPS":        ["Basic EPS", "Basic", "BasicEPS"],
+    "Diluted EPS":      ["Diluted EPS", "Diluted", "DilutedEPS"],
+    "EBITDA":           ["EBITDA", "Normalized EBITDA"],
+    "Tax Provision":    ["Tax Provision", "Income Tax Expense"],
+    "Interest Expense": ["Interest Expense", "Net Interest Income"],
+}
+
+
+def _resolve_row(df: pd.DataFrame, canonical: str) -> str | None:
+    """
+    Return the first alias for `canonical` that exists in df.index,
+    or None if no alias is found. Handles income_stmt vs financials differences.
+    """
+    for alias in _ROW_ALIASES.get(canonical, [canonical]):
+        if alias in df.index:
+            return alias
+    return None
 
 
 # ── Rating helpers ────────────────────────────────────────────────────────
@@ -194,11 +232,14 @@ def _parse_income_stmt(
 
         rows = []
         for row_name in priority_rows:
-            if row_name not in df.index:
+            # Use _resolve_row to find the actual label in this DataFrame
+            # (handles income_stmt vs financials label differences)
+            actual_row = _resolve_row(df, row_name)
+            if actual_row is None:
                 continue
             row_data = {"label": _row_label(row_name)}
             for i, (col, key) in enumerate(zip(cols, period_keys)):
-                val = df.loc[row_name, col]
+                val = df.loc[actual_row, col]
                 if row_name in ("Basic EPS", "Diluted EPS"):
                     row_data[key] = _safe(val, 1)
                 else:
@@ -314,8 +355,8 @@ def _build_financial_trends(
         if df is None or df.empty:
             return []
 
-        revenue_key = "Total Revenue"
-        profit_key  = "Net Income"
+        revenue_key = _resolve_row(df, "Total Revenue")
+        profit_key  = _resolve_row(df, "Net Income")
 
         trend = []
         cols = list(df.columns)
@@ -416,9 +457,10 @@ def compute_fundamentals(
     rev_growth = None
     if financials is not None and not financials.empty:
         try:
-            if "Total Revenue" in financials.index and len(financials.columns) >= 2:
-                rev_curr = financials.loc["Total Revenue", financials.columns[0]]
-                rev_prev = financials.loc["Total Revenue", financials.columns[1]]
+            rev_row = _resolve_row(financials, "Total Revenue")
+            if rev_row and len(financials.columns) >= 2:
+                rev_curr = financials.loc[rev_row, financials.columns[0]]
+                rev_prev = financials.loc[rev_row, financials.columns[1]]
                 if rev_prev and rev_prev != 0:
                     rev_growth = _safe(((rev_curr - rev_prev) / abs(rev_prev)) * 100, 1)
         except Exception:
@@ -428,9 +470,10 @@ def compute_fundamentals(
     profit_growth = None
     if financials is not None and not financials.empty:
         try:
-            if "Net Income" in financials.index and len(financials.columns) >= 2:
-                p_curr = financials.loc["Net Income", financials.columns[0]]
-                p_prev = financials.loc["Net Income", financials.columns[1]]
+            net_row = _resolve_row(financials, "Net Income")
+            if net_row and len(financials.columns) >= 2:
+                p_curr = financials.loc[net_row, financials.columns[0]]
+                p_prev = financials.loc[net_row, financials.columns[1]]
                 if p_prev and p_prev != 0:
                     profit_growth = _safe(((p_curr - p_prev) / abs(p_prev)) * 100, 1)
         except Exception:
